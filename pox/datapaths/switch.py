@@ -33,6 +33,7 @@ TODO
 
 from pox.lib.util import assert_type, initHelper, dpid_to_str
 from pox.lib.revent import Event, EventMixin
+from pox.lib.recoco import Timer
 from pox.openflow.libopenflow_01 import *
 import pox.openflow.libopenflow_01 as of
 from pox.openflow.util import make_type_to_unpacker_table
@@ -40,6 +41,8 @@ from pox.openflow.flow_table import SwitchFlowTable
 from pox.lib.packet import *
 
 import logging
+import struct
+import time
 
 
 class DpPacketOut (Event):
@@ -94,6 +97,8 @@ class SoftwareSwitchBase (object):
     self._has_sent_hello = False
 
     self.table = SwitchFlowTable()
+    self.table.addListeners(self)
+
     self._lookup_count = 0
     self._matched_count = 0
 
@@ -159,6 +164,47 @@ class SoftwareSwitchBase (object):
       if getattr(self.features, "act_" + name) is False: continue
       self.action_handlers[value] = h
 
+    # Set up handlers for stats handlers
+    # That is, self.stats_handlers[OFPST_FOO] = self._stats_foo
+    #TODO: Refactor this with above
+    self.stats_handlers = {}
+    for value,name in ofp_stats_type_map.iteritems():
+      name = name.split("OFPST_",1)[-1].lower()
+      h = getattr(self, "_stats_" + name, None)
+      if not h: continue
+      self.stats_handlers[value] = h
+
+  @property
+  def _time (self):
+    """
+    Get the current time
+
+    This should be used for, e.g., calculating timeouts.  It currently isn't
+    used everywhere it should be.
+
+    Override this to change time behavior.
+    """
+    return time.time()
+
+  def _handle_FlowTableModification (self, event):
+    """
+    Handle flow table modification events
+    """
+    # Currently, we only use this for sending flow_removed messages
+    if not event.removed: return
+
+    if event.reason in (OFPRR_IDLE_TIMEOUT,OFPRR_HARD_TIMEOUT,OFPRR_DELETE):
+      # These reasons may lead to a flow_removed
+      count = 0
+      for entry in event.removed:
+        if entry.flags & OFPFF_SEND_FLOW_REM:
+          # Flow wants removal notification -- send it
+          fr = entry.to_flow_removed(self._time, reason=event.reason)
+          self.send(fr)
+          count += 1
+      self.log.debug("%d flows removed (%d removal notifications)",
+          len(event.removed), count)
+
   def rx_message (self, connection, msg):
     """
     Handle an incoming OpenFlow message
@@ -180,30 +226,34 @@ class SoftwareSwitchBase (object):
     connection.set_message_handler(self.rx_message)
     self._connection = connection
 
-  def send (self, message):
+  def send (self, message, connection = None):
     """
     Send a message to this switch's communication partner
     """
-
-    if self._connection:
-      self._connection.send(message)
+    if connection is None:
+      connection = self._connection
+    if connection:
+      connection.send(message)
     else:
       self.log.debug("Asked to send message %s, but not connected", message)
 
   def _rx_hello (self, ofp, connection):
+    #FIXME: This isn't really how hello is supposed to work -- we're supposed
+    #       to send it immediately on connection.  See _send_hello().
     self.send_hello()
 
   def _rx_echo_request (self, ofp, connection):
     """
     Handles echo requests
     """
-    msg = ofp_echo_reply(xid=ofp.xid)
+    msg = ofp_echo_reply(xid=ofp.xid, body=ofp.body)
     self.send(msg)
 
   def _rx_features_request (self, ofp, connection):
     """
     Handles feature requests
     """
+    self.log.debug("Send features reply")
     msg = ofp_features_reply(datapath_id = self.dpid,
                              xid = ofp.xid,
                              n_buffers = self.max_buffers,
@@ -249,76 +299,26 @@ class SoftwareSwitchBase (object):
 
   def _rx_get_config_request (self, ofp, connection):
     msg = ofp_get_config_reply(xid = ofp.xid)
+    #FIXME: Set attributes of reply!
     self.send(msg)
 
   def _rx_stats_request (self, ofp, connection):
-    def desc_stats (ofp):
-      try:
-        from pox.core import core
-        return ofp_desc_stats(mfr_desc="POX",
-                              hw_desc=core._get_platform_info(),
-                              sw_desc=core.version_string,
-                              serial_num=str(self.dpid),
-                              dp_desc=type(self).__name__)
-      except:
-        return ofp_desc_stats(mfr_desc="POX",
-                              hw_desc="Unknown",
-                              sw_desc="Unknown",
-                              serial_num=str(self.dpid),
-                              dp_desc=type(self).__name__)
+    handler = self.stats_handlers.get(ofp.type)
+    if handler is None:
+      self.log.warning("Stats type %s not implemented", ofp.type)
 
+      self.send_error(type=OFPET_BAD_REQUEST, code=OFPBRC_BAD_STAT,
+                      ofp=ofp, connection=connection)
+      return
 
-    def flow_stats (ofp):
-      req = ofp.body
-      assert self.table_id in (TABLE_ALL, 0)
-      return self.table.flow_stats(req.match, req.out_port)
-
-    def aggregate_stats (ofp):
-      req = ofp.body
-      assert self.table_id in (TABLE_ALL, 0)
-      return self.table.aggregate_stats(req.match, out_port)
-
-    def table_stats (ofp):
-      # Some of these may come from the actual table(s) in the future...
-      r = ofp_table_stats()
-      r.table_id = 0
-      r.name = "Default"
-      r.wildcards = OFPFW_ALL
-      r.max_entries = self.max_entries
-      r.active_count = len(self.table)
-      r.lookup_count = self._lookup_count
-      r.matched_count = self._matched_count
-      return r
-
-    def port_stats (ofp):
-      req = ofp.body
-      if req.port_no == OFPP_NONE:
-        return self.port_stats.values()
-      else:
-        return self.port_stats[req.port_no]
-
-    def queue_stats (ofp):
-      raise AttributeError("not implemented")
-
-    stats_handlers = {
-        OFPST_DESC: desc_stats,
-        OFPST_FLOW: flow_stats,
-        OFPST_AGGREGATE: aggregate_stats,
-        OFPST_TABLE: table_stats,
-        OFPST_PORT: port_stats,
-        OFPST_QUEUE: queue_stats
-    }
-
-    if ofp.type in stats_handlers:
-      handler = stats_handlers[ofp.type]
-    else:
-      raise AttributeError("Unsupported stats request type %d" % (ofp.type,))
-
-    reply = ofp_stats_reply(xid=ofp.xid, body=handler(ofp))
-    self.log.debug("Sending stats reply %s", str(reply))
-    self.send(reply)
+    body = handler(ofp, connection=connection)
+    if body is not None:
+      reply = ofp_stats_reply(xid=ofp.xid, type=ofp.type, body=body)
+      self.log.debug("Sending stats reply %s", reply)
+      self.send(reply)
 
   def _rx_set_config (self, config, connection):
+    #FIXME: Implement this!
     pass
 
   def _rx_port_mod (self, port_mod, connection):
@@ -422,6 +422,24 @@ class SoftwareSwitchBase (object):
     assert reason in ofp_port_reason_rev_map.values()
     msg = ofp_port_status(desc=port, reason=reason)
     self.send(msg)
+
+  def send_error (self, type, code, ofp=None, data=None, connection=None):
+    """
+    Send an error
+
+    If you pass ofp, it will be used as the source of the error's XID and
+    data.
+    You can override the data by also specifying data.
+    """
+    err = ofp_error(type=type, code=code)
+    if ofp:
+      err.xid = ofp.xid
+      err.data = ofp.pack()
+    else:
+      err.xid = 0
+    if data is not None:
+      err.data = data
+    self.send(err, connection = connection)
 
   def rx_packet (self, packet, in_port, packet_data = None):
     """
@@ -562,13 +580,12 @@ class SoftwareSwitchBase (object):
       self.send_packet_in(in_port, buffer_id, packet, reason=OFPR_ACTION,
                           data_length=max_len)
     elif out_port == OFPP_TABLE:
-      # There better be a table entry there, else we get infinite recurision
-      # between switch<->controller
-      # Note that this isn't infinite recursion, since the table entry's
-      # out_port will not be OFPP_TABLE
+      # Do we disable send-to-controller when performing this?
+      # (Currently, there's the possibility that a table miss from this
+      # will result in a send-to-controller which may send back to table...)
       self.rx_packet(packet, in_port)
     else:
-      raise("Unsupported virtual output port: %d" % (out_port,))
+      self.log.warn("Unsupported virtual output port: %d", out_port)
 
   def _buffer_packet (self, packet, in_port=None):
     """
@@ -599,10 +616,10 @@ class SoftwareSwitchBase (object):
     """
     buffer_id = buffer_id - 1
     if (buffer_id >= len(self._packet_buffer)) or (buffer_id < 0):
-      self.log.warn("Invalid output buffer id: %d", buffer_id)
+      self.log.warn("Invalid output buffer id: %d", buffer_id + 1)
       return
     if self._packet_buffer[buffer_id] is None:
-      self.log.warn("Buffer %d has already been flushed", buffer_id)
+      self.log.warn("Buffer %d has already been flushed", buffer_id + 1)
       return
     (packet, in_port) = self._packet_buffer[buffer_id]
     self._process_actions_for_packet(actions, packet, in_port, ofp)
@@ -753,6 +770,59 @@ class SoftwareSwitchBase (object):
 #    packet.next.ttl = packet.next.ttl - 1
 #    return packet
 
+  def _stats_desc (self, ofp, connection):
+    try:
+      from pox.core import core
+      return ofp_desc_stats(mfr_desc="POX",
+                            hw_desc=core._get_platform_info(),
+                            sw_desc=core.version_string,
+                            serial_num=str(self.dpid),
+                            dp_desc=type(self).__name__)
+    except:
+      return ofp_desc_stats(mfr_desc="POX",
+                            hw_desc="Unknown",
+                            sw_desc="Unknown",
+                            serial_num=str(self.dpid),
+                            dp_desc=type(self).__name__)
+
+
+  def _stats_flow (self, ofp, connection):
+    if ofp.body.table_id not in (TABLE_ALL, 0):
+      return [] # No flows for other tables
+    out_port = ofp.body.out_port
+    if out_port == OFPP_NONE: out_port = None # Don't filter
+    return self.table.flow_stats(ofp.body.match, out_port)
+
+  def _stats_aggregate (self, ofp, connection):
+    if ofp.body.table_id not in (TABLE_ALL, 0):
+      return [] # No flows for other tables
+    out_port = ofp.body.out_port
+    if out_port == OFPP_NONE: out_port = None # Don't filter
+    return self.table.aggregate_stats(ofp.body.match, out_port)
+
+  def _stats_table (self, ofp, connection):
+    # Some of these may come from the actual table(s) in the future...
+    r = ofp_table_stats()
+    r.table_id = 0
+    r.name = "Default"
+    r.wildcards = OFPFW_ALL
+    r.max_entries = self.max_entries
+    r.active_count = len(self.table)
+    r.lookup_count = self._lookup_count
+    r.matched_count = self._matched_count
+    return r
+
+  def _stats_port (self, ofp, connection):
+    req = ofp.body
+    if req.port_no == OFPP_NONE:
+      return self.port_stats.values()
+    else:
+      return self.port_stats[req.port_no]
+
+#  def _stats_queue (self, ofp, connection):
+#    # Not implemented
+#    pass
+
   def __repr__ (self):
     return "%s(dpid=%s, num_ports=%d)" % (type(self).__name__,
                                           dpid_to_str(self.dpid),
@@ -771,6 +841,25 @@ class SoftwareSwitch (SoftwareSwitchBase, EventMixin):
     self.raiseEvent(DpPacketOut(self, packet, self.ports[port_no]))
 
 
+class ExpireMixin (object):
+  """
+  Adds expiration to a switch
+
+  Inherit *before* switch base.
+  """
+  _expire_period = 2
+
+  def __init__ (self, *args, **kw):
+    expire_period = kw.pop('expire_period', self._expire_period)
+    super(ExpireMixin,self).__init__(*args, **kw)
+    if not expire_period:
+      # Disable
+      return
+    self._expire_timer = Timer(expire_period,
+                               self.table.remove_expired_entries,
+                               recurring=True)
+
+
 class OFConnection (object):
   """
   A codec for OpenFlow messages.
@@ -786,6 +875,12 @@ class OFConnection (object):
   # Globally unique identifier for the Connection instance
   ID = 0
 
+  # See _error_handler for information the meanings of these
+  ERR_BAD_VERSION = 1
+  ERR_NO_UNPACKER = 2
+  ERR_BAD_LENGTH  = 3
+  ERR_EXCEPTION   = 4
+
   # These methods are called externally by IOWorker
   def msg (self, m):
     self.log.debug("%s %s", str(self), str(m))
@@ -795,10 +890,10 @@ class OFConnection (object):
     self.log.info("%s %s", str(self), str(m))
 
   def __init__ (self, io_worker):
+    self.starting = True # No data yet
     self.io_worker = io_worker
     self.io_worker.rx_handler = self.read
     self.controller_id = io_worker.socket.getpeername()
-    self.error_handler = None
     OFConnection.ID += 1
     self.ID = OFConnection.ID
     self.log = logging.getLogger("ControllerConnection(id=%d)" % (self.ID,))
@@ -824,29 +919,46 @@ class OFConnection (object):
     self.io_worker.send(data)
 
   def read (self, io_worker):
+    #FIXME: Do we need to pass io_worker here?
     while True:
       message = io_worker.peek()
       if len(message) < 4:
         break
 
-      if ord(message[0]) != OFP_VERSION:
-        e = ValueError("Bad OpenFlow version (%s) on connection %s",
-                       ord(message[0]), str(self))
-        if self.error_handler:
-          return self.error_handler(e)
-        else:
-          raise
-
       # Parse head of OpenFlow message by hand
+      ofp_version = ord(message[0])
       ofp_type = ord(message[1])
+
+      if ofp_version != OFP_VERSION:
+        r = self._error_handler(self.ERR_BAD_VERSION, ofp_version)
+        if r is False: break
+        continue
+
       packet_length = ord(message[2]) << 8 | ord(message[3])
       if packet_length > len(message):
         break
 
+      if ofp_type >= 0 and ofp_type < len(self.unpackers):
+        unpacker = self.unpackers[ofp_type]
+      else:
+        unpacker = None
+      if unpacker is None:
+        r = self._error_handler(self.ERR_NO_UNPACKER, ofp_type)
+        if r is False: break
+        io_worker.consume_receive_buf(packet_length)
+        continue
+
       new_offset, msg_obj = self.unpackers[ofp_type](message, 0)
-      assert new_offset == packet_length
+      if new_offset != packet_length:
+        r = self._error_handler(self.ERR_BAD_LENGTH,
+                                (msg_obj, packet_length, new_offset))
+        if r is False: break
+        # Assume sender was right and we should skip what it told us to.
+        io_worker.consume_receive_buf(packet_length)
+        continue
 
       io_worker.consume_receive_buf(packet_length)
+      self.starting = False
 
       if self.on_message_received is None:
         raise RuntimeError("on_message_receieved hasn't been set yet!")
@@ -854,12 +966,54 @@ class OFConnection (object):
       try:
         self.on_message_received(self, msg_obj)
       except Exception as e:
-        if self.error_handler:
-          return self.error_handler(e)
-        else:
-          raise
+        r = self._error_handler(self.ERR_EXCEPTION,
+                                (e,message[:packet_length],msg_obj))
+        if r is False: break
+        continue
 
     return True
+
+  def _error_handler (self, reason, info):
+      """
+      Called when read() has an error
+
+      reason is one of OFConnection.ERR_X
+
+      info depends on reason:
+      ERR_BAD_VERSION: claimed version number
+      ERR_NO_UNPACKER: claimed message type
+      ERR_BAD_LENGTH: (unpacked message, claimed length, unpacked length)
+      ERR_EXCEPTION: (exception, raw message, unpacked message)
+
+      Return False to halt processing of subsequent data (makes sense to
+      do this if you called connection.close() here, for example).
+      """
+      if reason == OFConnection.ERR_BAD_VERSION:
+        self.log.warn('Unsupported OpenFlow version 0x%02x', info)
+        if self.starting:
+          xid = 0
+          message = io_worker.peek()
+          if len(message) >= 8:
+            xid = struct.unpack_from('!L', message, 4)[0]
+          err = ofp_error(type=OFPET_HELLO_FAILED, code=OFPHFC_INCOMPATIBLE)
+          err.xid = port_mod.xid
+          err.data = 'Version unsupported'
+          self.send(err)
+        self.close()
+        return False
+      elif reason == OFConnection.ERR_NO_UNPACKER:
+        self.log.warn('Unsupported OpenFlow message type 0x%02x', info)
+      elif reason == OFConnection.ERR_BAD_LENGTH:
+        t = type(info[0]).__name__
+        self.log.error('Different idea of message length for %s '
+                       '(us:%s them:%s)' % (t, info[2], info[1]))
+      elif reason == OFConnection.ERR_EXCEPTION:
+        t = type(info[0]).__name__
+        self.log.exception('Exception handling %s' % (t,))
+      else:
+        self.log.error("Unhandled error")
+        self.close()
+        return False
 
   def close (self):
     self.io_worker.close()

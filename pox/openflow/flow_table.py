@@ -20,6 +20,7 @@ from libopenflow_01 import *
 from pox.lib.revent import *
 
 import time
+import math
 
 # FlowTable Entries:
 #   match - ofp_match (13-tuple)
@@ -28,19 +29,21 @@ import time
 class TableEntry (object):
   """
   Models a flow table entry, with a match, actions, and options/flags/counters.
-  Note: the current time can either be specified explicitely with the optional 'now' parameter or is taken from time.time()
+
+  Note: The current time can either be specified explicitely with the optional
+        'now' parameter or is taken from time.time()
   """
-
-  def __init__(self,priority=OFP_DEFAULT_PRIORITY, cookie = 0, idle_timeout=0, hard_timeout=0, flags=0, match=ofp_match(), actions=[], buffer_id=None, now=None):
-
-    # overriding __new__ instead of init to make fields optional. There's probably a better way to do this.
-    if now==None: now = time.time()
-    self.counters = {
-        'created': now,
-        'last_touched': now,
-        'bytes': 0,
-        'packets': 0
-    }
+  def __init__ (self, priority=OFP_DEFAULT_PRIORITY, cookie=0, idle_timeout=0,
+                hard_timeout=0, flags=0, match=ofp_match(), actions=[],
+                buffer_id=None, now=None):
+    """
+    Initialize table entry
+    """
+    if now is None: now = time.time()
+    self.created = now
+    self.last_touched = self.created
+    self.byte_count = 0
+    self.packet_count = 0
     self.priority = priority
     self.cookie = cookie
     self.idle_timeout = idle_timeout
@@ -51,203 +54,308 @@ class TableEntry (object):
     self.buffer_id = buffer_id
 
   @staticmethod
-  def from_flow_mod(flow_mod):
-    priority = flow_mod.priority
-    cookie = flow_mod.cookie
-    match = flow_mod.match
-    actions = flow_mod.actions
-    buffer_id = flow_mod.buffer_id
-    flags = flow_mod.flags
+  def from_flow_mod (flow_mod):
+    return TableEntry(priority=flow_mod.priority,
+                      cookie=flow_mod.cookie,
+                      idle_timeout=flow_mod.idle_timeout,
+                      hard_timeout=flow_mod.hard_timeout,
+                      flags=flow_mod.flags,
+                      match=flow_mod.match,
+                      actions=flow_mod.actions,
+                      buffer_id=flow_mod.buffer_id)
 
-    return TableEntry(priority, cookie, flow_mod.idle_timeout, flow_mod.hard_timeout, flags, match, actions, buffer_id)
+  def to_flow_mod (self, flags=None, **kw):
+    if flags is None: flags = self.flags
+    return ofp_flow_mod(priority=self.priority,
+                        cookie=self.cookie,
+                        match=self.match,
+                        idle_timeout=self.idle_timeout,
+                        hard_timeout=self.hard_timeout,
+                        actions=self.actions,
+                        buffer_id=self.buffer_id,
+                        flags=flags, **kw)
 
-  def to_flow_mod(self, flags=None, **kw):
-    if flags is None:
-      flags = self.flags
-    return ofp_flow_mod(priority = self.priority, cookie = self.cookie, match = self.match,
-                        idle_timeout = self.idle_timeout, hard_timeout = self.hard_timeout,
-                          actions = self.actions, buffer_id = self.buffer_id, flags = flags, **kw)
+  @property
+  def effective_priority (self):
+    """
+    Exact matches effectively have an "infinite" priority
+    """
+    return self.priority if self.match.is_wildcarded else (1<<16) + 1
 
-  def is_matched_by(self, match, priority = None, strict = False, out_port=None):
-    """ return whether /this/ entry is matched by some other entry (e.g., for FLOW_MOD updates) """
-    check_port = lambda: out_port == None or any(isinstance(a, ofp_action_output) and a.port == out_port for a in self.actions)
+  def is_matched_by (self, match, priority=None, strict=False, out_port=None):
+    """
+    Tests whether a given match object matches this entry
 
-    if(strict):
-      return (self.match == match and self.priority == priority) and check_port()
+    Used for, e.g., flow_mod updates
+
+    If out_port is any value besides None, the the flow entry must contain an
+    output action to the specified port.
+    """
+    match_a = lambda a: isinstance(a, ofp_action_output) and a.port == out_port
+    port_matches = (out_port is None) or any(match_a(a) for a in self.actions)
+
+    if strict:
+      return port_matches and self.match == match and self.priority == priority
     else:
-      return match.matches_with_wildcards(self.match) and check_port()
+      return port_matches and match.matches_with_wildcards(self.match)
 
-  def touch_packet(self, byte_count, now=None):
-    """ update the counters and expiry timer of this entry for a packet with a given byte count"""
-    if now==None: now = time.time()
-    self.counters["bytes"] += byte_count
-    self.counters["packets"] += 1
-    self.counters["last_touched"] = now
+  def touch_packet (self, byte_count, now=None):
+    """
+    Updates information of this entry based on encountering a packet.
 
-  def is_expired(self, now=None):
-    """" return whether this flow entry is expired due to its idle timeout or hard timeout"""
-    if now==None: now = time.time()
-    return (self.hard_timeout > 0 and now - self.counters["created"] > self.hard_timeout) or (self.idle_timeout > 0 and now - self.counters["last_touched"] > self.idle_timeout)
+    Updates both the cumulative given byte counts of packets encountered and
+    the expiration timer.
+    """
+    if now is None: now = time.time()
+    self.byte_count += byte_count
+    self.packet_count += 1
+    self.last_touched = now
+
+  def is_idle_timed_out (self, now=None):
+    if now is None: now = time.time()
+    if self.idle_timeout > 0:
+      if (now - self.last_touched) > self.idle_timeout:
+        return True
+    return False
+
+  def is_hard_timed_out (self, now=None):
+    if now is None: now = time.time()
+    if self.hard_timeout > 0:
+      if (now - self.created) > self.hard_timeout:
+        return True
+    return False
+
+  def is_expired (self, now=None):
+    """
+    Tests whether this flow entry is expired due to its idle or hard timeout
+    """
+    if now is None: now = time.time()
+    return self.is_idle_timed_out(now) or self.is_hard_timed_out(now)
 
   def __str__ (self):
-    return self.__class__.__name__ + "\n  " + self.show()
+    return type(self).__name__ + "\n  " + self.show()
 
-  def __repr__(self):
-    return "TableEntry("+self.show() + ")"
+  def __repr__ (self):
+    return "TableEntry(" + self.show() + ")"
 
-  def show(self):
-       return "priority=%s, cookie=%x, idle_timeoout=%d, hard_timeout=%d, match=%s, actions=%s buffer_id=%s" % (
-          self.priority, self.cookie, self.idle_timeout, self.hard_timeout, self.match, repr(self.actions), str(self.buffer_id))
+  def show (self):
+    outstr = ''
+    outstr += "priority=%s, " % self.priority
+    outstr += "cookie=%x, " % self.cookie
+    outstr += "idle_timeout=%d, " % self.idle_timeout
+    outstr += "hard_timeout=%d, " % self.hard_timeout
+    outstr += "match=%s, " % self.match
+    outstr += "actions=%s, " % repr(self.actions)
+    outstr += "buffer_id=%s" % str(self.buffer_id)
+    return outstr
 
-  def flow_stats(self, now=None):
-    if now == None: now = time.time()
-    duration = now - self.counters["created"]
-    return ofp_flow_stats (
-        match = self.match,
-        duration_sec = int(duration),
-        duration_nsec = int(duration * 1e9),
-        priority = self.priority,
-        idle_timeout = self.idle_timeout,
-        hard_timeout = self.hard_timeout,
-        cookie = self.cookie,
-        packet_count = self.counters["packets"],
-        byte_count = self.counters["bytes"],
-        actions = self.actions
-        )
+  def flow_stats (self, now=None):
+    if now is None: now = time.time()
+    dur_nsec,dur_sec = math.modf(now - self.created)
+    return ofp_flow_stats(match=self.match,
+                          duration_sec=int(dur_sec),
+                          duration_nsec=int(dur_nsec * 1e9),
+                          priority=self.priority,
+                          idle_timeout=self.idle_timeout,
+                          hard_timeout=self.hard_timeout,
+                          cookie=self.cookie,
+                          packet_count=self.packet_count,
+                          byte_count=self.byte_count,
+                          actions=self.actions)
+
+  def to_flow_removed (self, now=None, reason=None):
+    #TODO: Rename flow_stats to to_flow_stats and refactor?
+    if now is None: now = time.time()
+    dur_nsec,dur_sec = math.modf(now - self.created)
+    fr = ofp_flow_removed()
+    fr.match = self.match
+    fr.cookie = self.cookie
+    fr.priority = self.priority
+    fr.reason = reason
+    fr.duration_sec = int(dur_sec)
+    fr.duration_nsec = int(dur_nsec * 1e9)
+    fr.idle_timeout = self.idle_timeout
+    fr.hard_timeout = self.hard_timeout
+    fr.packet_count = self.packet_count
+    fr.byte_count = self.byte_count
+    return fr
 
 
 class FlowTableModification (Event):
-  def __init__(self, added=[], removed=[]):
+  def __init__ (self, added=[], removed=[], reason=None):
     Event.__init__(self)
     self.added = added
     self.removed = removed
 
+    # Reason for modification.
+    # Presently, this is only used for removals and is either one of OFPRR_x,
+    # or None if it does not correlate to any of the items in the spec.
+    self.reason = reason
+
 
 class FlowTable (EventMixin):
+  """
+  General model of a flow table.
+
+  Maintains an ordered list of flow entries, and finds matching entries for
+  packets and other entries. Supports expiration of flows.
+  """
   _eventMixin_events = set([FlowTableModification])
 
-  """
-  General model of a flow table. Maintains an ordered list of flow entries, and finds
-  matching entries for packets and other entries. Supports expiration of flows.
-  """
-  def __init__(self):
+  def __init__ (self):
     EventMixin.__init__(self)
-    # For now we represent the table as a multidimensional array.
-    #
-    # [ (cookie, match, counters, actions),
-    #   (cookie, match, counters, actions),
-    #    ...                        ]
-    #
-    # Implies O(N) lookup for now. TODO: fix
+
+    # Table is a list of TableEntry sorted by descending effective_priority.
     self._table = []
 
+  def _dirty (self):
+    """
+    Call when table changes
+    """
+    pass
+
   @property
-  def entries(self):
+  def entries (self):
     return self._table
 
-  def __len__(self):
+  def __len__ (self):
     return len(self._table)
 
-  def add_entry(self, entry):
-    if not isinstance(entry, TableEntry):
-      raise "Not an Entry type"
-    self._table.append(entry)
+  def add_entry (self, entry):
+    assert isinstance(entry, TableEntry)
 
-    # keep table sorted by descending priority, with exact matches always going first
-    # note: python sort is stable
-    self._table.sort(key=lambda(e): (e.priority if e.match.is_wildcarded else (1<<16) + 1), reverse=True)
+    #self._table.append(entry)
+    #self._table.sort(key=lambda e: e.effective_priority, reverse=True)
+
+    # Use binary search to insert at correct place
+    # This is faster even for modest table sizes, and way, way faster
+    # as the tables grow larger.
+    priority = entry.effective_priority
+    table = self._table
+    low = 0
+    high = len(table)
+    while low < high:
+        middle = (low + high) // 2
+        if priority >= table[middle].effective_priority:
+          high = middle
+          continue
+        low = middle + 1
+    table.insert(low, entry)
+
+    self._dirty()
 
     self.raiseEvent(FlowTableModification(added=[entry]))
 
-  def remove_entry(self, entry):
-    if not isinstance(entry, TableEntry):
-      raise "Not an Entry type"
+  def remove_entry (self, entry, reason=None):
+    assert isinstance(entry, TableEntry)
     self._table.remove(entry)
-    self.raiseEvent(FlowTableModification(removed=[entry]))
+    self._dirty()
+    self.raiseEvent(FlowTableModification(removed=[entry], reason=reason))
 
-  def entries_for_port(self, port_no):
-    entries = []
+  def matching_entries (self, match, priority=0, strict=False, out_port=None):
+    entry_match = lambda e: e.is_matched_by(match, priority, strict, out_port)
+    return [ entry for entry in self._table if entry_match(entry) ]
+
+  def flow_stats (self, match, out_port=None, now=None):
+    mc_es = self.matching_entries(match=match, strict=False, out_port=out_port)
+    return ( e.flow_stats(now) for e in mc_es )
+
+  def _remove_specific_entries (self, flows, reason=None):
+    #for entry in flows:
+    #  self._table.remove(entry)
+    #self._table = [entry for entry in self._table if entry not in flows]
+    if not flows: return
+    self._dirty()
+    remove_flows = set(flows)
+    i = 0
+    while i < len(self._table):
+      entry = self._table[i]
+      if entry in remove_flows:
+        del self._table[i]
+        remove_flows.remove(entry)
+        if not remove_flows: break
+      else:
+        i += 1
+    assert len(remove_flows) == 0
+    self.raiseEvent(FlowTableModification(removed=flows, reason=reason))
+
+  def remove_expired_entries (self, now=None):
+    idle = []
+    hard = []
+    now = time.time()
     for entry in self._table:
-      actions = entry.actions
-      if len(actions) > 0:
-        last_action = actions[-1]
-        if type(last_action) == ofp_action_output:
-          outgoing_port = last_action.port#.port_no
-          if outgoing_port == port_no:
-            entries.append(entry)
-    return entries
+      if entry.is_idle_timed_out(now):
+        idle.append(entry)
+      elif entry.is_hard_timed_out(now):
+        hard.append(entry)
+    self._remove_specific_entries(idle, OFPRR_IDLE_TIMEOUT)
+    self._remove_specific_entries(hard, OFPRR_HARD_TIMEOUT)
 
-  def matching_entries(self, match, priority=0, strict=False, out_port=None):
-    return [ entry for entry in self._table if entry.is_matched_by(match, priority, strict, out_port) ]
-
-  def flow_stats(self, match, out_port=None, now=None):
-    return ( e.flow_stats() for e in self.matching_entries(match=match, strict=False, out_port=out_port))
-
-  def expired_entries(self, now=None):
-    return [ entry for entry in self._table if entry.is_expired(now) ]
-
-  def remove_expired_entries(self, now=None):
-    remove_flows = self.expired_entries(now)
-    for entry in remove_flows:
-        self._table.remove(entry)
-    self.raiseEvent(FlowTableModification(removed=remove_flows))
-    return remove_flows
-
-  def remove_matching_entries(self, match, priority=0, strict=False):
+  def remove_matching_entries (self, match, priority=0, strict=False,
+      reason=None):
     remove_flows = self.matching_entries(match, priority, strict)
-    for entry in remove_flows:
-        self._table.remove(entry)
-    self.raiseEvent(FlowTableModification(removed=remove_flows))
+    self._remove_specific_entries(remove_flows, reason=reason)
     return remove_flows
 
-  def entry_for_packet(self, packet, in_port):
-    """ return the highest priority flow table entry that matches the given packet
-    on the given in_port, or None if no matching entry is found. """
+  def entry_for_packet (self, packet, in_port):
+    """
+    Finds the flow table entry that matches the given packet.
+
+    Returns the highest priority flow table entry that matches the given packet
+    on the given in_port, or None if no matching entry is found.
+    """
     packet_match = ofp_match.from_packet(packet, in_port)
 
     for entry in self._table:
-      if entry.match.matches_with_wildcards(packet_match, consider_other_wildcards=False):
+      if entry.match.matches_with_wildcards(packet_match,
+                                            consider_other_wildcards=False):
         return entry
-    else:
-      return None
+
+    return None
 
 
-class SwitchFlowTable(FlowTable):
+class SwitchFlowTable (FlowTable):
   """
-  Model a flow table for our switch implementation. Handles the behavior in response
-  to the OF messages send to the switch
+  Models a flow table for our switch implementation.
+
+  Handles the behavior in response to the OF messages send to the switch
   """
 
-  def process_flow_mod(self, flow_mod):
-    """ Process a flow mod sent to the switch
-    @return a tuple (added|modified|removed, [list of affected entries])
+  def process_flow_mod (self, flow_mod):
     """
-    if(flow_mod.flags & OFPFF_CHECK_OVERLAP):
+    Process a flow mod sent to the switch.
+
+    Returns a tuple (added|modified|removed, [list of affected entries])
+    """
+    if flow_mod.flags & OFPFF_CHECK_OVERLAP:
       raise NotImplementedError("OFPFF_CHECK_OVERLAP checking not implemented")
-    if(flow_mod.out_port != OFPP_NONE and
-       flow_mod.command == ofp_flow_mod_command_rev_map['OFPFC_DELETE']):
+    if flow_mod.out_port != OFPP_NONE and flow_mod.command == OFPFC_DELETE:
       raise NotImplementedError("flow_mod outport checking not implemented")
 
-    if flow_mod.command == OFPFC_ADD:
+    command = flow_mod.command
+    match = flow_mod.match
+    priority = flow_mod.priority
+
+    if command == OFPFC_ADD:
       # exactly matching entries have to be removed
-      self.remove_matching_entries(flow_mod.match,flow_mod.priority, strict=True)
+      self.remove_matching_entries(match, priority=priority, strict=True)
       return ("added", self.add_entry(TableEntry.from_flow_mod(flow_mod)))
-    elif flow_mod.command == OFPFC_MODIFY or flow_mod.command == OFPFC_MODIFY_STRICT:
-      is_strict = (flow_mod.command == OFPFC_MODIFY_STRICT)
+    elif command == OFPFC_MODIFY or command == OFPFC_MODIFY_STRICT:
+      is_strict = (command == OFPFC_MODIFY_STRICT)
       modified = []
       for entry in self._table:
         # update the actions field in the matching flows
-        if(entry.is_matched_by(flow_mod.match, priority=flow_mod.priority, strict=is_strict)):
+        if entry.is_matched_by(match, priority=priority, strict=is_strict):
           entry.actions = flow_mod.actions
           modified.append(entry)
-      if(len(modified) == 0):
+      if len(modified) == 0:
         # if no matching entry is found, modify acts as add
         return ("added", self.add_entry(TableEntry.from_flow_mod(flow_mod)))
       else:
         return ("modified", modified)
-
-    elif flow_mod.command == OFPFC_DELETE or flow_mod.command == OFPFC_DELETE_STRICT:
-      is_strict = (flow_mod.command == OFPFC_DELETE_STRICT)
-      return ("removed", self.remove_matching_entries(flow_mod.match, flow_mod.priority, strict=is_strict))
+    elif command == OFPFC_DELETE or command == OFPFC_DELETE_STRICT:
+      is_strict = (command == OFPFC_DELETE_STRICT)
+      return ("removed", self.remove_matching_entries(match,
+          priority=priority, strict=is_strict, reason=OFPRR_DELETE))
     else:
-      raise AttributeError("Command not yet implemented: %s" % flow_mod.command)
+      raise AttributeError("Command not yet implemented: %s" % command)

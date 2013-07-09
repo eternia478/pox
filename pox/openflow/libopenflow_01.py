@@ -25,6 +25,7 @@ import sys
 from pox.lib.packet.packet_base import packet_base
 from pox.lib.packet.ethernet import ethernet
 from pox.lib.packet.vlan import vlan
+from pox.lib.packet.llc import llc
 from pox.lib.packet.ipv4 import ipv4
 from pox.lib.packet.udp import udp
 from pox.lib.packet.tcp import tcp
@@ -929,6 +930,15 @@ class ofp_match (ofp_base):
     match.dl_dst = packet.dst
     match.dl_type = packet.type
     p = packet.next
+
+    # Is this in the spec?
+    if packet.type < 1536:
+      match.dl_type = OFP_DL_TYPE_NOT_ETH_TYPE
+    # LLC then VLAN?  VLAN then LLC?
+    if isinstance(p, llc):
+      if p.has_snap and p.oui == '\0\0\0':
+        match.dl_type = p.eth_type
+        p = p.next
     if isinstance(p, vlan):
       match.dl_type = p.eth_type
       match.dl_vlan = p.id
@@ -2599,7 +2609,10 @@ class ofp_stats_reply (ofp_header):
   def pack (self):
     if self.type is None:
       if is_listlike(self.body):
-        b = self.body[0]
+        if len(self.body):
+          b = self.body[0]
+        else:
+          b = None # Will fail below
       else:
         b = self.body
       if isinstance(b, ofp_stats_body_base):
